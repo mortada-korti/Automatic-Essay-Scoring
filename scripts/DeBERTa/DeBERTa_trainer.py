@@ -94,7 +94,7 @@ print(f"Current device: {torch.cuda.current_device()} - {torch.cuda.get_device_n
 
 
 config_space = {
-    "learning_rate": [5e-5, 3e-5],     # Learning rates to try
+    "learning_rate": [5e-5],           # Learning rates to try
     "batch_size": [8],                 # Batch size (fixed)
     "epochs": [15],                    # Number of training epochs
     "dropout": [0.2],                  # Dropout rate for regularization
