@@ -94,7 +94,7 @@ print(f"Current device: {torch.cuda.current_device()} - {torch.cuda.get_device_n
 
 
 config_space = {
-    "learning_rate": [5e-5, 3e-5],     # Learning rates to try
+    "learning_rate": [5e-5],           # Learning rates to try
     "batch_size": [8],                 # Batch size (fixed)
     "epochs": [15],                    # Number of training epochs
     "dropout": [0.2],                  # Dropout rate for regularization
@@ -154,7 +154,7 @@ for config_id, values in enumerate(config_list):
         # Split data by prompt
         train_df = df[df["essay_set"].isin(split["train"])].copy()
         test_df = df[df["essay_set"] == split["test"]].copy()
-
+        
         # Convert to Hugging Face Datasets
         train_dataset = Dataset.from_pandas(train_df)
         test_dataset = Dataset.from_pandas(test_df)
@@ -172,7 +172,7 @@ for config_id, values in enumerate(config_list):
         model.to(device)
 
         # Freeze lower layers of Longformer
-        freeze_longformer_config_layers(model.encoder, num_unfrozen=config["unfrozen_layers"])
+        freeze_longformer_layers(model.encoder, num_unfrozen=config["unfrozen_layers"])
 
        # Assign auxiliary loss weight for entropy-based expert regularization
         model.encoder.config.aux_loss_weight = config["aux_loss_weight"]
