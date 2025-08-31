@@ -8,15 +8,19 @@
 # In[ ]:
 
 
+# These bring in ready-made BERT components and utilities from Hugging Face's Transformers library.
 from transformers.models.bert.modeling_bert import (
-    BertSelfAttention,      # The self-attention mechanism used inside BERT layers
-    BertSelfOutput,         # Applies a dense layer + residual connection + layer norm after attention
-    BertEmbeddings,         # Converts input token IDs to embeddings (token + segment + position)
-    BertPooler              # Produces a single pooled output from the final hidden state
+    BertSelfAttention,  # The multi-head self-attention mechanism used in BERT layers
+    BertSelfOutput,     # Post-attention dense + dropout + residual connection
+    BertEmbeddings,     # Word, position, and segment embeddings for BERT inputs
+    BertPooler          # The pooling layer that produces a fixed-size vector from BERT's output
 )
-from transformers import BertModel, BertPreTrainedModel  # Base BERT model and abstract class for custom BERT extensions
-import numpy as np     
-import torch           
+
+from transformers import BertModel, BertPreTrainedModel
+# BertModel        → Full pretrained BERT architecture (encoder only)
+# BertPreTrainedModel → Base class that handles loading, saving, and config management
+
+import torch  # PyTorch library for building and training neural networks
 
 
 # ### Mixture-of-Experts Feed-Forward Layer for BERT
@@ -24,85 +28,66 @@ import torch
 # In[ ]:
 
 
-class MoEFeedForward(torch.nn.Module):
-    """
-    Implements a Mixture-of-Experts (MoE) feed-forward layer that replaces the 
-    standard FFN in BERT. Multiple expert networks process the input, and a gating 
-    mechanism determines how to combine their outputs.
+# Purpose:
+# Implements a "Mixture of Experts" feed-forward network.
+# Each token's representation is processed by multiple expert networks.
+# A small gating network decides how much each expert contributes (top-k selection possible).
 
-    Parameters:
-        hidden_dim (int): Input and output dimension (usually the BERT hidden size).
-        intermediate_dim (int): Hidden size within each expert's feed-forward network.
-        num_experts (int): Total number of parallel expert networks.
-        dropout (float): Dropout probability applied to the final output.
-        top_k (int): Number of top experts to select (sparse gating); if set to 0, use all experts.
-    """
+class MoEFeedForward(torch.nn.Module):
     def __init__(self, hidden_dim, intermediate_dim, num_experts=7, dropout=0.2, top_k=2):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.intermediate_dim = intermediate_dim
-        self.num_experts = num_experts
-        self.top_k = top_k  
+        self.hidden_dim = hidden_dim                # Input/output feature size
+        self.intermediate_dim = intermediate_dim    # Hidden size inside each expert
+        self.num_experts = num_experts              # Total experts available
+        self.top_k = top_k                          # Number of experts to use per token
 
-        # Define the expert networks — each one is a small feed-forward block
+        # Gate network: predicts weights for each expert based on input
+        self.gate = torch.nn.Linear(hidden_dim, num_experts)
+
+        # Dropout to reduce overfitting
+        self.dropout = torch.nn.Dropout(dropout)
+
+        # Create the list of expert feed-forward networks
         self.experts = torch.nn.ModuleList([
             torch.nn.Sequential(
-                torch.nn.Linear(hidden_dim, intermediate_dim),
-                torch.nn.GELU(),
-                torch.nn.Linear(intermediate_dim, hidden_dim)
+                torch.nn.Linear(hidden_dim, intermediate_dim),  # First dense layer
+                torch.nn.GELU(),                                # Activation function
+                torch.nn.Linear(intermediate_dim, hidden_dim)   # Second dense layer
             ) for expert in range(num_experts)
         ])
 
-        # Gating network: assigns weights to each expert based on input
-        self.gate = torch.nn.Linear(hidden_dim, num_experts)
+    def forward(self, x, expert_mask=None):     
+        # Get gate scores for each expert (before softmax)
+        gate_logits = self.gate(x)
 
-        # Dropout applied to final output
-        self.dropout = torch.nn.Dropout(dropout)
+        if 0 < self.top_k < self.num_experts:
+            # Select the top-k experts per token
+            topk_values, topk_indices = torch.topk(gate_logits, self.top_k, dim=-1)
 
-    def forward(self, x):
-        """
-        Forward pass through the MoE layer.
+            # Initialize all as -inf (so non-top-k experts get zero weight after softmax)
+            masked = torch.full_like(gate_logits, float("-inf"))
 
-        Parameters:
-            x (Tensor): Input tensor of shape (batch_size, seq_len, hidden_dim)
+            # Fill only top-k positions with their scores
+            masked.scatter_(-1, topk_indices, topk_values)
 
-        Returns:
-            Tuple[Tensor, Tensor]: 
-                - Output tensor of the same shape as input after combining expert outputs.
-                - Gating weights tensor (used for interpretability or diagnostics).
-        """
-        gate_logits = self.gate(x)  # Compute unnormalized scores for each expert
+            # Stabilize values by subtracting the max in each row
+            masked = masked - masked.amax(dim=-1, keepdim=True)
 
-        # Use top-k gating to select a few experts per token
-        if self.top_k > 0 and self.top_k < self.num_experts:
-            topk_values, topk_indices = torch.topk(gate_logits, self.top_k, dim=-1)  # (batch, seq_len, top_k)
-
-            # Create a full mask and fill in top-k positions with their logits
-            mask = torch.full_like(gate_logits, float('-inf')) 
-            mask.scatter_(-1, topk_indices, topk_values)
-
-            # Apply softmax to get normalized gating weights (only top-k will be nonzero)
-            gate_weights = torch.nn.functional.softmax(mask, dim=-1)
+            # Softmax to turn scores into probabilities
+            gate_weights = torch.nn.functional.softmax(masked, dim=-1)
         else:
-            # If top_k is 0 or equal to number of experts, use all experts
-            gate_weights = torch.nn.functional.softmax(gate_logits, dim=-1)
+            # Use all experts — just stabilize then softmax
+            logits = gate_logits - gate_logits.amax(dim=-1, keepdim=True)
+            gate_weights = torch.nn.functional.softmax(logits, dim=-1)
 
-        # Compute outputs from each expert
-        expert_outputs = [expert(x) for expert in self.experts]  # List of (batch, seq_len, hidden_dim)
+        # Run all experts and stack their outputs: shape (batch, seq_len, num_experts, hidden_dim)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
 
-        # Stack expert outputs: shape becomes (batch, seq_len, num_experts, hidden_dim)
-        expert_outputs = torch.stack(expert_outputs, dim=2)
+        # Weighted sum of experts based on gate probabilities
+        output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=2)
 
-        # Reshape gate weights to align for broadcasting: (batch, seq_len, num_experts, 1)
-        gate_weights = gate_weights.unsqueeze(-1)
-
-        # Multiply each expert's output by its corresponding gate weight
-        weighted_output = expert_outputs * gate_weights  # (batch, seq_len, num_experts, hidden_dim)
-
-        # Sum over experts to get final output per token
-        output = weighted_output.sum(dim=2)  # (batch, seq_len, hidden_dim)
-
-        return self.dropout(output), gate_weights.squeeze(-1)  # Also return gate weights
+        # Apply dropout and return both the output and the gate weights
+        return self.dropout(output), gate_weights
 
 
 # ### Custom BERT Layer with Mixture-of-Experts (MoE) Feed-Forward
@@ -110,82 +95,69 @@ class MoEFeedForward(torch.nn.Module):
 # In[ ]:
 
 
-class BertLayerWithMoE(torch.nn.Module):
-    """
-    A custom BERT layer that replaces the standard feed-forward sublayer with a 
-    Mixture-of-Experts module. It preserves the original BERT attention mechanism
-    while injecting MoE routing for better flexibility and parameter efficiency.
+# Purpose:
+# A modified BERT encoder layer where the usual feed-forward network (FFN)
+# is replaced with the Mixture of Experts (MoE) feed-forward layer.
+# Still keeps the standard BERT self-attention, residual connections, and layer normalization.
 
-    Parameters:
-        config (BertConfig): Standard configuration object for BERT.
-        num_experts (int): Number of expert FFN modules in the MoE block.
-        top_k (int): Number of experts to activate per token (sparse routing).
-    """
+class BertLayerWithMoE(torch.nn.Module):
     def __init__(self, config, num_experts=7, top_k=2):
         super().__init__()
 
-        # BERT's original multi-head self-attention mechanism
+        # Standard multi-head self-attention module
         self.attention = BertSelfAttention(config)
+
+        # Output stage after attention: dense + dropout + residual
         self.attention_output = BertSelfOutput(config)
 
-        # Replace the feed-forward network with a MoE module
-        self.intermediate = MoEFeedForward(  
-            num_experts=num_experts,
-            hidden_dim=config.hidden_size,
-            dropout=config.hidden_dropout_prob,
-            intermediate_dim=config.intermediate_size,
-            top_k=top_k
+        # Replace the standard FFN with the MoE FFN
+        self.intermediate = MoEFeedForward(
+            num_experts=num_experts,                     # total experts
+            hidden_dim=config.hidden_size,               # input/output size
+            dropout=config.hidden_dropout_prob,          # dropout rate
+            intermediate_dim=config.intermediate_size,   # hidden size in each expert
+            top_k=top_k                                  # how many experts to pick per token
         )
 
-        # Final projection and normalization (as in original BERT layer)
-        self.output_dense = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        # Dropout after MoE output
         self.output_dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+
+        # Layer normalization after combining MoE output with attention output
         self.output_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def initialize_experts_from_ffn(self, pretrained_ffn):
-        """
-        Initialize all experts in the MoE block by copying weights from a standard 
-        pretrained FFN (e.g., from a vanilla BERT model). Adds small noise to break symmetry.
-
-        Parameters:
-            pretrained_ffn (torch.nn.Sequential): A standard FFN block with 2 Linear layers and GELU.
-        """
+        # Copy weights from an existing (pretrained) FFN into all experts
         for expert in self.intermediate.experts:
-            # Copy weights and biases from the pretrained FFN
+            # First linear layer weights & bias
             expert[0].weight.data.copy_(pretrained_ffn[0].weight.data.clone())
             expert[0].bias.data.copy_(pretrained_ffn[0].bias.data.clone())
+
+            # Second linear layer weights & bias
             expert[2].weight.data.copy_(pretrained_ffn[2].weight.data.clone())
             expert[2].bias.data.copy_(pretrained_ffn[2].bias.data.clone())
 
-            # Add small random noise to each expert to diversify them slightly
+            # Add small random noise so experts can diversify during training
+            noise_scale = 0.0 if len(self.intermediate.experts) == 1 else 0.0
             for param in expert.parameters():
-                param.data += 0.01 * torch.randn_like(param)
+                param.data.add_(noise_scale * torch.randn_like(param))
 
-    def forward(self, hidden_states, attention_mask=None):
-        """
-        Forward pass through the MoE-enhanced BERT layer.
-
-        Parameters:
-            hidden_states (Tensor): Input embeddings (batch_size, seq_len, hidden_dim)
-            attention_mask (Tensor, optional): Mask for attention (used for padding).
-
-        Returns:
-            Tuple[Tensor, Tensor]:
-                - Final hidden states after attention + MoE + residual + norm
-                - Gating weights from MoE (for interpretability)
-        """
-        # Standard BERT attention
+    def forward(self, hidden_states, attention_mask=None, expert_mask=None):
+        # Apply self-attention to input
         attention_output = self.attention(hidden_states, attention_mask)[0]
+
+        # Apply attention output projection + dropout + residual
         attention_output = self.attention_output(attention_output, hidden_states)
 
-        # MoE block replaces the original FFN
-        moe_output, gate_weights = self.intermediate(attention_output)
+        # Pass through the MoE feed-forward network
+        moe_output, gate_weights = self.intermediate(attention_output, expert_mask=expert_mask)
 
-        # Final dense layer, dropout, and residual connection with layer norm
-        ffn_output = self.output_dense(moe_output)
-        ffn_output = self.output_dropout(ffn_output)
+        # Apply dropout to MoE output
+        ffn_output = self.output_dropout(moe_output)
+
+        # Add residual connection from attention output and normalize
         layer_output = self.output_norm(ffn_output + attention_output)
 
+        # Return the final layer output and the expert gate weights
         return layer_output, gate_weights
 
 
@@ -194,89 +166,98 @@ class BertLayerWithMoE(torch.nn.Module):
 # In[ ]:
 
 
-class MoeBERTModel(BertPreTrainedModel):
-    """
-    Full BERT model where each encoder layer uses a Mixture-of-Experts (MoE) feed-forward module
-    instead of the standard FFN. Initialized from a pretrained BERT model to inherit knowledge.
+# Purpose:
+# A custom BERT model where every transformer layer's feed-forward network (FFN)
+# is replaced by a Mixture-of-Experts (MoE) version.
+# Starts from a pretrained BERT, reuses its embeddings, pooler, and attention layers,
+# then initializes MoE experts from the pretrained FFN weights.
 
-    Parameters:
-        config (BertConfig): BERT configuration object.
-        num_experts (int): Number of experts per layer.
-        top_k (int): Number of active experts selected by the gating mechanism per token.
-    """
-    def __init__(self, config, num_experts=7, top_k=4):
+class MoeBERTModel(BertPreTrainedModel):
+    def __init__(self, config, num_experts=7, top_k=2, pretrained_name_or_path="bert-base-uncased"):
         super().__init__(config)
         self.config = config
+        self.num_experts = num_experts  # total experts per layer
+        self.top_k = top_k              # number of active experts per token
 
-        # Token + position + segment embeddings
-        self.embeddings = BertEmbeddings(config)
+        # Load pretrained BERT model (for initialization)
+        base_bert = BertModel.from_pretrained(pretrained_name_or_path, config=config)
+        base_bert.eval()  # disable dropout during weight copying
 
-        # Replace original BERT encoder layers with MoE-enhanced layers
+        # Reuse pretrained embedding and pooler layers
+        self.embeddings = base_bert.embeddings
+        self.pooler = base_bert.pooler
+
+        # Create MoE-based transformer layers
         self.encoder_layers = torch.nn.ModuleList([
             BertLayerWithMoE(config, num_experts=num_experts, top_k=top_k)
-            for hidden_layer in range(config.num_hidden_layers)
+            for _ in range(config.num_hidden_layers)
         ])
 
-        # Pooler: creates a single embedding from the [CLS] token
-        self.pooler = BertPooler(config)
+        # Initialize MoE layers from the pretrained FFN weights
+        with torch.no_grad():
+            for i, moe_layer in enumerate(self.encoder_layers):
+                base_layer = base_bert.encoder.layer[i]
 
-        # Initialize parameters
-        self.init_weights()
+                # Reuse attention sublayers directly from pretrained BERT
+                moe_layer.attention = base_layer.attention.self
+                moe_layer.attention_output = base_layer.attention.output
 
-        # Load a standard BERT model to transfer pretrained weights into the MoE experts
-        base_bert = BertModel(config)
-        base_bert.eval()  # We only use it to read weights
+                # Copy LayerNorm weights from pretrained
+                moe_layer.output_norm.weight.copy_(base_layer.output.LayerNorm.weight)
+                moe_layer.output_norm.bias.copy_(base_layer.output.LayerNorm.bias)
 
-        for i, moe_layer in enumerate(self.encoder_layers):
-            # Extract the original FFN components from the i-th BERT layer
-            intermediate = base_bert.encoder.layer[i].intermediate.dense
-            output = base_bert.encoder.layer[i].output.dense
+                # Create a reference FFN sequence from pretrained layer
+                pretrained_ffn = torch.nn.Sequential(
+                    base_layer.intermediate.dense,
+                    torch.nn.GELU(),
+                    base_layer.output.dense
+                )
 
-            # Rebuild the FFN module to match the MoE expert structure
-            pretrained_ffn = torch.nn.Sequential(
-                intermediate,
-                torch.nn.GELU(),
-                output
+                # Initialize each MoE expert from the pretrained FFN
+                moe_layer.initialize_experts_from_ffn(pretrained_ffn)
+
+        # Store last gate weights for inspection
+        self._last_gate_weights = None
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, expert_mask=None):
+        device = input_ids.device
+        extended_attention_mask = None
+
+        # Prepare the attention mask for BERT (broadcasts to all heads)
+        if attention_mask is not None:
+            extended_attention_mask = self.get_extended_attention_mask(
+                attention_mask, input_ids.shape, device
             )
 
-            # Initialize each expert in the MoE layer with this pretrained FFN
-            moe_layer.initialize_experts_from_ffn(pretrained_ffn)
+        # Move expert mask to correct device if provided
+        if expert_mask is not None:
+            expert_mask = expert_mask.to(device)
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None):
-        """
-        Forward pass through the full MoE-enhanced BERT model.
+        # Run the embedding layer
+        hidden_states = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
 
-        Parameters:
-            input_ids (Tensor): Token IDs (batch_size, seq_len).
-            attention_mask (Tensor, optional): Mask to ignore padded tokens.
-            token_type_ids (Tensor, optional): Segment IDs (for sentence pairs).
+        gate_weights_list = []  # store gating info from each layer
 
-        Returns:
-            Tuple[Tensor, Tensor, List[Tensor]]:
-                - Last hidden states for all tokens
-                - Pooled output (usually from [CLS] token)
-                - List of gating weights from all layers (for inspection/analysis)
-        """
-        # Get embeddings for input tokens
-        embedding_output = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-
-        # Create attention mask in BERT's expected format
-        if attention_mask is not None:
-            extended_attention_mask = attention_mask[:, None, None, :]  # (batch, 1, 1, seq_len)
-            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0  # Masked positions get large negative
-        else:
-            extended_attention_mask = None
-
-        hidden_states = embedding_output
-        gate_weights_list = []  # To store MoE gate weights per layer
-
-        # Pass input through each encoder layer (with MoE)
+        # Pass through all MoE transformer layers
         for layer in self.encoder_layers:
-            hidden_states, gate_weights = layer(hidden_states, attention_mask=extended_attention_mask)
+            hidden_states, gate_weights = layer(
+                hidden_states,
+                attention_mask=extended_attention_mask,
+                expert_mask=expert_mask
+            )
             gate_weights_list.append(gate_weights)
 
-        # Final pooled embedding (typically from [CLS] token)
-        pooled_output = self.pooler(hidden_states)
+        # Pooling: mean over valid tokens if mask provided, else use [CLS] token
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)  # (B, T, 1)
+            summed = (hidden_states * mask).sum(dim=1)                   # sum over tokens
+            denom = mask.sum(dim=1).clamp_min(1e-6)                      # avoid div by zero
+            pooled_output = summed / denom
+        else:
+            pooled_output = hidden_states[:, 0]  # CLS token
+
+        # Save gating info for later inspection
+        self._last_gate_weights = gate_weights_list
 
         return hidden_states, pooled_output, gate_weights_list
 
@@ -286,101 +267,234 @@ class MoeBERTModel(BertPreTrainedModel):
 # In[ ]:
 
 
-class MoeBERTScorer(torch.nn.Module):
-    """
-    A regression head built on top of MoeBERTModel to predict essay scores.
-    Supports optional handcrafted features and auxiliary loss for encouraging balanced expert usage.
+# Purpose:
+# Wraps a MoeBERTModel to produce a single scalar score (e.g., for regression tasks).
+# Can take optional extra features, track expert usage stats, and apply extra loss terms
+# to supervise or regularize expert gating behavior.
 
-    Parameters:
-        base_model (MoeBERTModel): The base encoder model with MoE layers.
-        dropout (float): Dropout probability in the regression layer.
-        feature_dim (int): Number of external handcrafted features to concatenate with the [CLS] output.
-    """
+class MoeBERTScorer(torch.nn.Module):
     def __init__(self, base_model: MoeBERTModel, dropout=0.2, feature_dim=0):
         super().__init__()
-        self.encoder = base_model                     # MoeBERT encoder
-        self.feature_dim = feature_dim                # Dimension of handcrafted features
+        self.encoder = base_model                # The underlying BERT+MoE model
+        self.feature_dim = feature_dim            # Size of extra input features
 
-        # Total input dimension = [CLS] embedding + optional handcrafted features
+        # Total input size to regressor = BERT output size + any extra feature size
         input_dim = self.encoder.config.hidden_size + feature_dim
 
-        # Simple regressor: dense layer + dropout to predict a score
+        # Simple regressor: linear projection to 1 value + dropout
         self.regressor = torch.nn.Sequential(
             torch.nn.Linear(input_dim, 1),
             torch.nn.Dropout(dropout)
         )
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None,
-                features=None, labels=None, aux_loss_weight=0.5):
-        """
-        Forward pass through the model.
+        # For logging/debugging expert behavior
+        self.last_gate_weights = None
+        self.expert_usage_counts = None
+        self.expert_entropy = None
 
-        Parameters:
-            input_ids (Tensor): Token IDs.
-            attention_mask (Tensor, optional): Padding mask.
-            token_type_ids (Tensor, optional): Segment IDs.
-            features (Tensor, optional): Extra handcrafted features.
-            labels (Tensor, optional): Ground truth scores.
-            aux_loss_weight (float): Weight for entropy-based auxiliary loss on MoE gating.
-
-        Returns:
-            dict: Dictionary with:
-                - 'loss': Total loss (MSE + optional MoE entropy loss)
-                - 'logits': Predicted scores
-                - 'hidden_states': Final hidden layer outputs
-                - 'aux_loss': Entropy-based auxiliary regularization term (if labels are provided)
-        """
-        # Encode input through MoE BERT
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        token_type_ids=None,
+        features=None,
+        labels=None,
+        aux_loss_weight=0.5,
+        expert_mask=None
+    ):
+        # Encode inputs using the MoE BERT model
         hidden_states, pooled_output, gate_weights_list = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids
+            token_type_ids=token_type_ids,
+            expert_mask=expert_mask
         )
 
-        last_gate = gate_weights_list[-1]  # Use last layer's gate weights for auxiliary metrics
+        # Last layer's gating probabilities
+        last_gate = gate_weights_list[-1] 
 
-        # If entropy regularization is enabled and shape is valid
-        if aux_loss_weight > 0 and last_gate.ndim == 3:
-            usage_mask = (last_gate > 0).float()  # Binary mask: which experts are used
+        # ---- Optional: Track expert usage + entropy ----
+        if aux_loss_weight is not None and aux_loss_weight > 0 and last_gate.ndim == 3:
+            with torch.no_grad():
+                prob_mass = last_gate.sum(dim=(0, 1))  # total usage per expert across batch/tokens
+                self.expert_usage_counts = prob_mass.detach().cpu()
 
-            usage_count = usage_mask.sum(dim=(0, 1))  # Count how often each expert is selected
-            self.expert_usage_counts = usage_count.detach().cpu()
+                pm_sum = prob_mass.sum()
+                if pm_sum > 0:
+                    # Normalize to distribution and compute entropy
+                    prob_dist = (prob_mass / (pm_sum + 1e-12)).clamp_min(1e-12)
+                    self.expert_entropy = float(-(prob_dist * prob_dist.log()).sum().item())
+                else:
+                    self.expert_entropy = 0.0
 
-            # Calculate entropy of expert usage distribution
-            prob_dist = self.expert_usage_counts / self.expert_usage_counts.sum()
-            self.expert_entropy = -(prob_dist * torch.log(prob_dist + 1e-8)).sum().item()
+        # Save average gate weights for inspection
+        with torch.no_grad():
+            self.last_gate_weights = last_gate.mean(dim=1).detach().cpu()
 
-        # Save mean gate weights per expert (for diagnostics)
-        self.last_gate_weights = gate_weights_list[-1].mean(dim=1).detach().cpu()
-
-        # Optionally concatenate handcrafted features
+        # ---- Append extra features if provided ----
         if features is not None:
+            if features.device != pooled_output.device:
+                features = features.to(pooled_output.device)
+            if features.dtype != pooled_output.dtype:
+                features = features.to(pooled_output.dtype)
             pooled_output = torch.cat([pooled_output, features], dim=-1)
 
-        # Predict final score
-        score = self.regressor(pooled_output).squeeze(-1)  # (batch_size,)
+        # ---- Predict score ----
+        score = self.regressor(pooled_output).squeeze(-1)  # (B,)
 
-        loss = None  # Initialize loss
+        # ---- Loss computation ----
+        loss = None
+        aux_loss = None
 
         if labels is not None:
-            # Base loss: mean squared error between predicted and true scores
-            loss = torch.nn.functional.mse_loss(score, labels.float())
+            labels = labels.to(score.dtype)
 
-            if gate_weights_list:
-                gate_weights = gate_weights_list[-1]                # Use final layer's gates
-                mean_gates = gate_weights.mean(dim=(0, 1))          # Average over batch and sequence
-                entropy = -(mean_gates * torch.log(mean_gates + 1e-9)).sum()  # Entropy of expert usage
-                aux_loss = -entropy                                 # Encourage high entropy (diverse usage)
+            # Base regression loss
+            loss = torch.nn.functional.mse_loss(score, labels)
 
-                # Add auxiliary loss to total loss
+            # Auxiliary entropy regularization loss (discourage low-entropy gate usage)
+            if gate_weights_list and aux_loss_weight is not None and aux_loss_weight > 0:
+                gate_weights = gate_weights_list[-1]  
+                mean_gates = gate_weights.mean(dim=(0, 1))  
+                mean_gates = mean_gates / (mean_gates.sum() + 1e-12)
+                mean_gates = mean_gates.clamp_min(1e-12)
+                entropy = -(mean_gates * mean_gates.log()).sum()
+                aux_loss = -entropy  
                 loss = loss + aux_loss_weight * aux_loss
 
+        # ---- Return outputs ----
         return {
-            "loss": loss,
-            "logits": score,
-            "hidden_states": hidden_states,
+            "loss": loss,                    # total loss (if labels given)
+            "logits": score,                  # predicted scores
+            "hidden_states": hidden_states,   # encoder hidden states
             "aux_loss": aux_loss if labels is not None else None
         }
+
+
+# ### preprocess
+
+# In[ ]:
+
+
+# Purpose:
+# Converts a raw essay example into tokenized BERT inputs plus extra features and labels.
+# - Tokenizes the essay text.
+# - Adds the normalized score as the regression label.
+# - Collects handcrafted numerical features.
+# - Keeps track of which essay set it belongs to.
+
+def preprocess(example, tokenizer):
+    # Tokenize the essay text with fixed length (truncate/pad to 512 tokens)
+    tokens = tokenizer(
+        example["essay"],
+        truncation=True,
+        padding="max_length",
+        max_length=512,
+    )
+
+    # Add the normalized score as the label for training
+    tokens["labels"] = float(example["normalized_score"])
+
+    # Prefixes for handcrafted features we want to extract
+    feature_prefixes = ("len_", "read_", "comp_", "var_", "sent_")
+
+    # Collect all (key, value) pairs that start with those prefixes
+    feat_items = [(k, v) for k, v in example.items() if k.startswith(feature_prefixes)]
+
+    # Sort features by their key name to ensure consistent ordering
+    feat_items.sort(key=lambda kv: kv[0])  
+
+    # Convert feature values to floats
+    handcrafted_feats = [float(v) for _, v in feat_items]
+
+    # Store features in tokens dictionary
+    tokens["features"] = handcrafted_feats
+
+    # Store essay set ID as an integer
+    tokens["essay_set"] = int(example["essay_set"])
+
+    return tokens
+
+
+# ### map_essay_set_to_expert
+
+# In[ ]:
+
+
+# Purpose:
+# Creates a mapping from essay set IDs to expert indices.
+# Ensures mapping is consistent by sorting the set IDs first.
+
+def map_essay_set_to_expert(train_sets):
+    # Enumerate over sorted essay set IDs and assign each one a unique index
+    return {eid: idx for idx, eid in enumerate(sorted(train_sets))}
+
+
+# ### add_expert_mask
+
+# In[ ]:
+
+
+# Purpose:
+# Assigns an expert index to an example based on its essay set ID.
+# If the essay set is not in the map, assigns None.
+
+def add_expert_mask(example, expert_map):
+    # Get essay set ID (or None if missing)
+    es = example.get("essay_set", None)
+
+    # If the essay set exists in the map, use its expert index
+    if es in expert_map:
+        example["expert_mask"] = expert_map[es]
+    else:
+        # If not found, mark expert mask as None
+        example["expert_mask"] = None
+
+    return example
+
+
+# ### data_collator
+
+# In[ ]:
+
+
+# Purpose:
+# Custom batch collation function for Hugging Face Trainer.
+# Converts a list of feature dictionaries into a batch of PyTorch tensors,
+# handling both standard BERT inputs and additional custom fields.
+
+def data_collator(features):
+    batch = {}  # will store the batched tensors
+
+    # Batch token IDs if present
+    if "input_ids" in features[0]:
+        batch["input_ids"] = torch.as_tensor([f["input_ids"] for f in features], dtype=torch.long)
+
+    # Batch attention masks if present
+    if "attention_mask" in features[0]:
+        batch["attention_mask"] = torch.as_tensor([f["attention_mask"] for f in features], dtype=torch.long)
+
+    # Batch token type IDs if present and not None
+    if "token_type_ids" in features[0] and features[0]["token_type_ids"] is not None:
+        batch["token_type_ids"] = torch.as_tensor([f["token_type_ids"] for f in features], dtype=torch.long)
+
+    # Batch labels (float for regression)
+    if "labels" in features[0]:
+        batch["labels"] = torch.as_tensor([f["labels"] for f in features], dtype=torch.float32)
+
+    # Batch handcrafted features if they exist and are non-empty
+    if "features" in features[0] and features[0]["features"] is not None:
+        first_feats = features[0]["features"]
+        if isinstance(first_feats, (list, tuple)) and len(first_feats) > 0:
+            batch["features"] = torch.as_tensor([f["features"] for f in features], dtype=torch.float32)
+
+    # Batch expert mask if all examples have it
+    if "expert_mask" in features[0]:
+        mask_vals = [f["expert_mask"] for f in features]
+        if all(m is not None for m in mask_vals):
+            batch["expert_mask"] = torch.as_tensor(mask_vals, dtype=torch.long)
+
+    return batch
 
 
 # ### Freeze BERT Layers Except the Last Few (Fine-Tuning Strategy)
@@ -388,30 +502,36 @@ class MoeBERTScorer(torch.nn.Module):
 # In[ ]:
 
 
+# Purpose:
+# Freezes all model parameters except for:
+# - The last `num_unfrozen` encoder layers
+# - The pooler (if present)
+# - The regressor head (if present)
+# Useful for fine-tuning only the top layers while keeping most of BERT fixed.
+
 def freeze_bert_layers(model, num_unfrozen=2):
-    """
-    Freezes most of the BERT model parameters to reduce training cost and avoid overfitting,
-    except for the last `num_unfrozen` encoder layers and the pooler.
+    # Freeze all parameters in the model
+    for p in model.parameters():
+        p.requires_grad = False
 
-    Parameters:
-        model (torch.nn.Module): A BERT-based model (e.g., MoeBERTModel or BertModel).
-        num_unfrozen (int): Number of encoder layers (from the top) to keep trainable.
-    """
-    # Freeze all parameters by default
-    for param in model.parameters():
-        param.requires_grad = False
+    # Get the encoder module (may be directly the model or inside .encoder)
+    encoder = getattr(model, "encoder", model)
 
-    # If model has an encoder with layers, selectively unfreeze the last few layers
-    if hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
-        total_layers = len(model.encoder.layer)
+    # Unfreeze the last `num_unfrozen` encoder layers
+    if hasattr(encoder, "encoder_layers"):
+        total_layers = len(encoder.encoder_layers)
+        start = max(0, total_layers - int(num_unfrozen))
+        for i in range(start, total_layers):
+            for p in encoder.encoder_layers[i].parameters():
+                p.requires_grad = True
 
-        # Unfreeze only the last `num_unfrozen` layers
-        for i in range(total_layers - num_unfrozen, total_layers):
-            for param in model.encoder.layer[i].parameters():
-                param.requires_grad = True
+    # Unfreeze the pooler if it exists
+    if hasattr(encoder, "pooler") and encoder.pooler is not None:
+        for p in encoder.pooler.parameters():
+            p.requires_grad = True
 
-    # Also unfreeze the pooler if present (e.g., to fine-tune [CLS] token representation)
-    if hasattr(model, "pooler"):  
-        for param in model.pooler.parameters():
-            param.requires_grad = True
+    # Unfreeze the regressor head if it exists
+    if hasattr(model, "regressor") and model.regressor is not None:
+        for p in model.regressor.parameters():
+            p.requires_grad = True
 
